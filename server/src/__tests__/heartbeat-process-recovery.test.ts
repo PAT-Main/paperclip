@@ -2042,6 +2042,55 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await expect(sourceBlockerIssueIds(companyId, sourceIssueId)).resolves.toEqual([issueId]);
   });
 
+  it("blocks failed work without enqueueing recovery when the agent enters error", async () => {
+    const { agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+    });
+    await db
+      .update(agents)
+      .set({ status: "error", errorReason: "adapter failed" })
+      .where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const issue = await waitForValue(async () =>
+      db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => {
+          const row = rows[0] ?? null;
+          return row?.status === "blocked" ? row : null;
+        }),
+      8_000,
+    );
+    expect(issue).toMatchObject({
+      status: "blocked",
+      executionRunId: null,
+      checkoutRunId: null,
+    });
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      id: runId,
+      status: "failed",
+      errorCode: "process_lost",
+    });
+
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(agent).toMatchObject({
+      status: "error",
+    });
+    expect(agent?.errorReason).toContain("Process lost");
+  }, 12_000);
+
   it("does not block paused-tree work when immediate continuation recovery is suppressed by the hold", async () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "idle",
